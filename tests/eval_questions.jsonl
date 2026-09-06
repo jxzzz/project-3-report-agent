@@ -1,0 +1,4 @@
+{"question": "2026年8月的总销售额和订单量是多少？", "must_contain": ["72", "22,188"]}
+{"question": "2026年8月消费金额最高的前三位客户是谁？", "must_contain": ["赵六", "张三", "王五"]}
+{"question": "2026年8月退款率最高的商品是什么？", "must_contain": ["笔记本支架"]}
+{"question": "客户的满意度评分是多少？", "should_refuse": true}
