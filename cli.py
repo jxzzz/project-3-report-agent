@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from graph import build_graph
+from stream_events import format_console_line, iter_stream_events
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -26,16 +27,37 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="多 Agent 数据分析报告生成器")
     parser.add_argument("--question", required=True, help="用户问题")
     parser.add_argument("--approve", action="store_true", help="跳过人工确认")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="实时打印各节点进度事件（需同时指定 --approve）",
+    )
     args = parser.parse_args()
+
+    if args.stream and not args.approve:
+        parser.error("--stream 需要同时指定 --approve")
 
     started = time.perf_counter()
 
     app = build_graph()
-    result = app.invoke({
+    initial_state = {
         "user_request": args.question,
         "auto_approve": args.approve,
         "status": "start",
-    })
+    }
+
+    if args.stream:
+        print("\n===== 实时进度 =====")
+        result = None
+        for event, final_state in iter_stream_events(app, initial_state, started):
+            line = format_console_line(event)
+            if line:
+                print(line, flush=True)
+            if final_state is not None:
+                result = final_state
+        result = result or app.invoke(initial_state)
+    else:
+        result = app.invoke(initial_state)
 
     latency_ms = round((time.perf_counter() - started) * 1000, 1)
 

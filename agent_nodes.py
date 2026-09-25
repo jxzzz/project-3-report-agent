@@ -2,6 +2,13 @@ from llm_client import chat_json
 from state import ReportState
 from utils.report_db import schema_text
 from llm_client import chat, chat_json
+from stream_events import (
+    EVT_NODE_END,
+    EVT_NODE_START,
+    EVT_SQL_ATTEMPT,
+    EVT_SQL_ROUND_START,
+    emit,
+)
 import json
 import re
 
@@ -47,6 +54,7 @@ PLANNER_SYSTEM_PROMPT = """
 
 
 def planner_node(state: ReportState) -> dict:
+    emit(EVT_NODE_START, "planner")
     user_request = state["user_request"]
 
     user_content = f"""
@@ -69,6 +77,18 @@ def planner_node(state: ReportState) -> dict:
     )
 
     usage = parsed.pop("_usage", {})
+
+    emit(
+        EVT_NODE_END,
+        "planner",
+        feasible=parsed.get("feasible"),
+        report_title=parsed.get("report_title", ""),
+        sections=[
+            section.get("title", "")
+            for section in parsed.get("sections", [])
+        ],
+        data_requirement_count=len(parsed.get("data_requirements", [])),
+    )
 
     return {
         "plan": parsed,
@@ -107,9 +127,11 @@ DATA_AGENT_SYSTEM_PROMPT = """
 
 
 def data_agent_node(state: ReportState) -> dict:
+    emit(EVT_NODE_START, "data_agent")
     plan = state["plan"]
 
     if not plan.get("feasible"):
+        emit(EVT_NODE_END, "data_agent", status="blocked", ok_count=0, failed_count=0)
         return {
             "status": "blocked",
             "final_report": f"无法生成报告：{plan.get('reason', '数据库中没有足够数据')}",
@@ -137,6 +159,13 @@ def data_agent_node(state: ReportState) -> dict:
 
         if not failed:
             break
+
+        emit(
+            EVT_SQL_ROUND_START,
+            "data_agent",
+            attempt=attempt,
+            pending_ids=[record["id"] for record in failed],
+        )
 
         failed_text = "\n".join(
             f"- id={record['id']} description={record['description']} "
@@ -186,6 +215,16 @@ def data_agent_node(state: ReportState) -> dict:
                 })
                 record["attempts"] = attempt
                 record["error"] = error
+                emit(
+                    EVT_SQL_ATTEMPT,
+                    "data_agent",
+                    requirement_id=record["id"],
+                    attempt=attempt,
+                    ok=False,
+                    sql=None,
+                    error=error,
+                    row_count=None,
+                )
                 continue
 
             result = execute_select(sql)
@@ -199,6 +238,16 @@ def data_agent_node(state: ReportState) -> dict:
                 })
                 record["attempts"] = attempt
                 record["error"] = error
+                emit(
+                    EVT_SQL_ATTEMPT,
+                    "data_agent",
+                    requirement_id=record["id"],
+                    attempt=attempt,
+                    ok=False,
+                    sql=sql,
+                    error=error,
+                    row_count=None,
+                )
                 continue
 
             record["attempts"] = attempt
@@ -211,10 +260,29 @@ def data_agent_node(state: ReportState) -> dict:
                 "sql": sql,
                 "error": None,
             })
+            emit(
+                EVT_SQL_ATTEMPT,
+                "data_agent",
+                requirement_id=record["id"],
+                attempt=attempt,
+                ok=True,
+                sql=sql,
+                error=None,
+                row_count=result.get("row_count"),
+            )
 
     failed_again = [record for record in records if not record["ok"]]
 
+    ok_count = len(records) - len(failed_again)
+
     if failed_again:
+        emit(
+            EVT_NODE_END,
+            "data_agent",
+            status="data_error",
+            ok_count=ok_count,
+            failed_count=len(failed_again),
+        )
         return {
             "queries": records,
             "usage": usage_records,
@@ -222,6 +290,13 @@ def data_agent_node(state: ReportState) -> dict:
             "data_error": "部分数据查询在多次修正后仍然失败，请人工检查 SQL",
         }
 
+    emit(
+        EVT_NODE_END,
+        "data_agent",
+        status="data_ready",
+        ok_count=ok_count,
+        failed_count=0,
+    )
     return {
         "queries": records,
         "usage": usage_records,
@@ -259,6 +334,7 @@ WRITER_SYSTEM_PROMPT = """
 
 
 def writer_node(state: ReportState) -> dict:
+    emit(EVT_NODE_START, "writer")
     plan = state["plan"]
     queries = state["queries"]
     user_request = state["user_request"]
@@ -314,6 +390,13 @@ def writer_node(state: ReportState) -> dict:
     )
 
     usage = result["usage"]
+
+    emit(
+        EVT_NODE_END,
+        "writer",
+        draft_chars=len(result["content"]),
+        round=len(review_history) + 1,
+    )
 
     return {
         "draft": result["content"],
@@ -409,6 +492,7 @@ REVIEWER_SYSTEM_PROMPT = """
 
 
 def reviewer_node(state: ReportState) -> dict:
+    emit(EVT_NODE_START, "reviewer")
     plan = state["plan"]
     queries = state["queries"]
     draft = state["draft"]
@@ -417,6 +501,15 @@ def reviewer_node(state: ReportState) -> dict:
     hard_issues = _hard_rule_check(draft, queries)
 
     if hard_issues:
+        emit(
+            EVT_NODE_END,
+            "reviewer",
+            round=current_round,
+            decision="fix",
+            hard_rule=True,
+            issues=hard_issues,
+            summary="代码级硬校验未通过",
+        )
         return {
             "review_round": current_round,
             "review_history": [
@@ -469,6 +562,16 @@ Writer 草稿：
 
     decision = parsed.get("decision", "fix")
 
+    emit(
+        EVT_NODE_END,
+        "reviewer",
+        round=current_round,
+        decision=decision,
+        hard_rule=False,
+        issues=parsed.get("issues", []),
+        summary=parsed.get("summary", ""),
+    )
+
     return {
         "review_round": current_round,
         "review_history": [
@@ -493,39 +596,45 @@ MAX_REVIEW_ROUNDS = 2
 
 
 def blocked_node(state: ReportState) -> dict:
+    emit(EVT_NODE_START, "blocked")
     plan = state.get("plan", {})
 
     if not plan.get("feasible"):
-        return {
+        result = {
             "status": "blocked",
             "final_report": f"无法生成报告：{plan.get('reason', '数据库没有足够数据')}",
         }
-
-    if state.get("status") == "data_error":
-        return {
+    elif state.get("status") == "data_error":
+        result = {
             "status": "blocked",
             "final_report": "部分数据查询在多次修正后仍然失败，报告已停止生成。",
         }
+    else:
+        history = state.get("review_history", [])
 
-    history = state.get("review_history", [])
+        if history and history[-1].get("decision") == "fix":
+            issues = "\n".join(
+                f"- {issue}" for issue in history[-1].get("issues", [])
+            )
+            result = {
+                "status": "blocked",
+                "final_report": f"报告多次审查未通过，不输出最终报告：\n{issues}",
+            }
+        else:
+            result = {
+                "status": "blocked",
+                "final_report": "流程未能生成报告，需要人工介入。",
+            }
 
-    if history and history[-1].get("decision") == "fix":
-        issues = "\n".join(
-            f"- {issue}" for issue in history[-1].get("issues", [])
-        )
-        return {
-            "status": "blocked",
-            "final_report": f"报告多次审查未通过，不输出最终报告：\n{issues}",
-        }
-
-    return {
-        "status": "blocked",
-        "final_report": "流程未能生成报告，需要人工介入。",
-    }
+    emit(EVT_NODE_END, "blocked", reason=result["final_report"][:200])
+    return result
 
 
 def human_approval_node(state: ReportState) -> dict:
+    emit(EVT_NODE_START, "human_gate")
+
     if state.get("auto_approve"):
+        emit(EVT_NODE_END, "human_gate", status="approved", auto=True)
         return {
             "status": "approved",
             "final_report": state["draft"],
@@ -536,11 +645,13 @@ def human_approval_node(state: ReportState) -> dict:
     answer = input("是否确认并输出这份报告？(y/n) ").strip().lower()
 
     if answer in {"y", "yes"}:
+        emit(EVT_NODE_END, "human_gate", status="approved", auto=False)
         return {
             "status": "approved",
             "final_report": state["draft"],
         }
 
+    emit(EVT_NODE_END, "human_gate", status="rejected", auto=False)
     return {
         "status": "rejected",
         "final_report": "报告未获得人工确认，已取消。",
