@@ -1,8 +1,10 @@
 import logging
 import time
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
@@ -21,6 +23,13 @@ logger = logging.getLogger("report-agent")
 
 app = FastAPI(title="多 Agent 数据分析报告服务", version="0.1.0")
 report_graph = build_graph()
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 class ReportRequest(BaseModel):

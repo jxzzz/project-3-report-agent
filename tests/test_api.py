@@ -26,6 +26,15 @@ def test_health():
     assert response.json() == {"status": "ok"}
 
 
+def test_index_serves_console_page():
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "事件流" in response.text
+    assert "/report/stream" in response.text
+
+
 def test_question_is_required():
     response = client.post("/report", json={})
 
